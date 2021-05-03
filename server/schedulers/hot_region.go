@@ -32,6 +32,7 @@ import (
 	"github.com/tikv/pd/server/schedule/filter"
 	"github.com/tikv/pd/server/schedule/operator"
 	"github.com/tikv/pd/server/schedule/opt"
+	"github.com/tikv/pd/server/schedule/checker"
 	"github.com/tikv/pd/server/statistics"
 	"go.uber.org/zap"
 )
@@ -401,6 +402,7 @@ func (h *hotScheduler) addPendingInfluence(op *operator.Operator, srcStore, dstS
 }
 
 func (h *hotScheduler) balanceHotReadRegions(cluster opt.Cluster) []*operator.Operator {
+
 	// prefer to balance by leader
 	leaderSolver := newBalanceSolver(h, cluster, read, transferLeader)
 	ops := leaderSolver.solve()
@@ -410,6 +412,19 @@ func (h *hotScheduler) balanceHotReadRegions(cluster opt.Cluster) []*operator.Op
 
 	peerSolver := newBalanceSolver(h, cluster, read, movePeer)
 	ops = peerSolver.solve()
+	if len(ops) > 0 {
+		return ops
+	}
+
+	//TODO:add new BalanceSolver if follower read is on, create more Peer to share the pressure
+	addStoreSolver := newBalanceSolver(h, cluster, read, addPeer)
+	ops = addStoreSolver.solve()
+	if len(ops) > 0 {
+		return ops
+	}
+
+	removeStoreSolver := newBalanceSolver(h, cluster, read, removePeer)
+	ops = removeStoreSolver.solve()
 	if len(ops) > 0 {
 		return ops
 	}
@@ -539,29 +554,48 @@ func (bs *balanceSolver) solve() []*operator.Operator {
 		ops   []*operator.Operator
 		infls []Influence
 	)
+	switch bs.opTy {
+	case movePeer, transferLeader:
+		for srcStoreID := range bs.filterSrcStores() {
+			bs.cur.srcStoreID = srcStoreID
 
-	for srcStoreID := range bs.filterSrcStores() {
-		bs.cur.srcStoreID = srcStoreID
-
+			for _, srcPeerStat := range bs.filterHotPeers() {
+				bs.cur.srcPeerStat = srcPeerStat
+				bs.cur.region = bs.getRegion()
+				if bs.cur.region == nil {
+					continue
+				}
+				for dstStoreID := range bs.filterDstStores() {
+					bs.cur.dstStoreID = dstStoreID
+					bs.calcProgressiveRank()
+					if bs.cur.progressiveRank < 0 && bs.betterThan(best) {
+						if newOps, newInfls := bs.buildOperators(); len(newOps) > 0 {
+							ops = newOps
+							infls = newInfls
+							clone := *bs.cur
+							best = &clone
+						}
+					}
+				}
+			}
+		}
+	case addPeer:
 		for _, srcPeerStat := range bs.filterHotPeers() {
 			bs.cur.srcPeerStat = srcPeerStat
 			bs.cur.region = bs.getRegion()
 			if bs.cur.region == nil {
 				continue
 			}
-			for dstStoreID := range bs.filterDstStores() {
-				bs.cur.dstStoreID = dstStoreID
-				bs.calcProgressiveRank()
-				if bs.cur.progressiveRank < 0 && bs.betterThan(best) {
-					if newOps, newInfls := bs.buildOperators(); len(newOps) > 0 {
-						ops = newOps
-						infls = newInfls
-						clone := *bs.cur
-						best = &clone
-					}
-				}
+			if newOps, newInfls := bs.buildOperators(); len(newOps) > 0 {
+				ops = newOps
+				infls = newInfls
+				clone := *bs.cur
+				best = &clone
+				break
 			}
 		}
+	case removePeer:
+		break
 	}
 
 	for i := 0; i < len(ops); i++ {
@@ -704,7 +738,7 @@ func (bs *balanceSolver) getRegion() *core.RegionInfo {
 	}
 
 	switch bs.opTy {
-	case movePeer:
+	case movePeer, addPeer, removePeer:
 		srcPeer := region.GetStorePeer(bs.cur.srcStoreID)
 		if srcPeer == nil {
 			log.Debug("region does not have a peer on source store, maybe stat out of date", zap.Uint64("region-id", bs.cur.srcPeerStat.ID()))
@@ -980,7 +1014,7 @@ func (bs *balanceSolver) isReadyToBuild() bool {
 }
 
 func (bs *balanceSolver) buildOperators() ([]*operator.Operator, []Influence) {
-	if !bs.isReadyToBuild() {
+	if (bs.opTy == movePeer || bs.opTy == transferLeader) && !bs.isReadyToBuild() {
 		return nil, nil
 	}
 	var (
@@ -1020,6 +1054,27 @@ func (bs *balanceSolver) buildOperators() ([]*operator.Operator, []Influence) {
 		counters = append(counters,
 			hotDirectionCounter.WithLabelValues("transfer-leader", bs.rwTy.String(), strconv.FormatUint(bs.cur.srcStoreID, 10), "out"),
 			hotDirectionCounter.WithLabelValues("transfer-leader", bs.rwTy.String(), strconv.FormatUint(bs.cur.dstStoreID, 10), "in"))
+	case addPeer:
+		log.Debug("begin adding-peer wenchuanfu")
+		region := bs.cur.region
+		regionStores := bs.cluster.GetRegionStores(region)
+		rs := checker.Strategy("Hot Scheduler", bs.cluster, region)
+		target := rs.SelectStoreToAdd(regionStores)
+		if target == 0 {
+			log.Debug("no store to add replica", zap.Uint64("region-id", region.GetID()))
+			hotDirectionCounter.WithLabelValues("hot-scheduler", "no-target-store").Inc()
+			//r.regionWaitingList.Put(region.GetID(), nil)
+			return nil, nil
+		}
+		newPeer := &metapb.Peer{StoreId: target}
+		op, err = operator.CreateAddPeerOperator("add-peer", bs.cluster, region, newPeer, operator.OpReplica)
+		if err != nil {
+			log.Debug("create add peer operator fail", errs.ZapError(err))
+			return nil, nil
+		}
+		counters = append(counters,
+			hotDirectionCounter.WithLabelValues("add-peer", bs.rwTy.String(), strconv.FormatUint(target, 10), "in"))
+		log.Debug("adding-peer done wenchuanfu")
 	}
 
 	if err != nil {
@@ -1146,6 +1201,8 @@ type opType int
 const (
 	movePeer opType = iota
 	transferLeader
+	addPeer
+	removePeer
 )
 
 func (ty opType) String() string {

@@ -265,3 +265,12 @@ func (r *ReplicaChecker) strategy(region *core.RegionInfo) *ReplicaStrategy {
 		region:         region,
 	}
 }
+func Strategy(checkName string,cls opt.Cluster, region *core.RegionInfo) *ReplicaStrategy {
+	return &ReplicaStrategy{
+		checkerName: 	checkName,
+		cluster: 		cls,
+		locationLabels: cls.GetOpts().GetLocationLabels(),
+		isolationLevel: cls.GetOpts().GetIsolationLevel(),
+		region:			region,
+	}
+}
